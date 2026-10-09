@@ -281,7 +281,10 @@ async function run(): Promise<void> {
     }
   }
 
-  // Resolve Ollama base URL: env var takes precedence over config
+  // Resolve inference credentials: environment variables take precedence so
+  // secrets can live on the host instead of inside automaton.json.
+  const openaiApiKey = process.env.OPENAI_API_KEY || config.openaiApiKey;
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY || config.anthropicApiKey;
   const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || config.ollamaBaseUrl;
 
   // Create inference client — pass a live registry lookup so model names like
@@ -294,8 +297,8 @@ async function run(): Promise<void> {
     defaultModel: config.inferenceModel,
     maxTokens: config.maxTokensPerTurn,
     lowComputeModel: config.modelStrategy?.lowComputeModel || "gpt-5-mini",
-    openaiApiKey: config.openaiApiKey,
-    anthropicApiKey: config.anthropicApiKey,
+    openaiApiKey,
+    anthropicApiKey,
     ollamaBaseUrl,
     getModelProvider: (modelId) => modelRegistry.get(modelId)?.provider,
   });
