@@ -23,6 +23,7 @@ import type {
   SpendTrackerInterface,
   InputSource,
   ModelStrategyConfig,
+  SurvivalTier,
 } from "../types.js";
 import { DEFAULT_MODEL_STRATEGY_CONFIG } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
@@ -358,7 +359,7 @@ export async function runAgentLoop(
   onStateChange?.("waking");
 
   // Get financial state
-  let financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+  let financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm", Boolean(config.conwayApiKey));
 
   // Check if this is the first run
   const isFirstRun = db.getTurnCount() === 0;
@@ -426,68 +427,68 @@ export async function runAgentLoop(
       }
 
       // Refresh financial state periodically
-      financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+      financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm", Boolean(config.conwayApiKey));
 
-      // Check survival tier
-      // api_unreachable: creditsCents === -1 means API failed with no cache.
-      // Do NOT kill the agent; continue in low-compute mode and retry next tick.
-      if (financial.creditsCents === -1) {
-        log(config, "[API_UNREACHABLE] Balance API unreachable, continuing in low-compute mode.");
+      // Determine operational survival from the resources that are actually usable.
+      // Conway credits are only one possible compute source: a direct OpenAI,
+      // Anthropic, or Ollama backend keeps AUREON operational without Conway.
+      const tier = getOperationalSurvivalTier(financial, config);
+
+      // Conway-specific auto-topup remains available when Conway is configured,
+      // but it must never run or gate survival in provider-independent mode.
+      if (
+        config.conwayApiKey &&
+        (tier === "critical" || tier === "low_compute") &&
+        financial.usdcBalance >= 5
+      ) {
+        const INLINE_TOPUP_COOLDOWN_MS = 60_000;
+        const lastInlineTopup = db.getKV("last_inline_topup_attempt");
+        const cooldownExpired = !lastInlineTopup ||
+          Date.now() - new Date(lastInlineTopup).getTime() >= INLINE_TOPUP_COOLDOWN_MS;
+
+        if (cooldownExpired) {
+          db.setKV("last_inline_topup_attempt", new Date().toISOString());
+          try {
+            const { bootstrapTopup } = await import("../conway/topup.js");
+            const topupResult = await bootstrapTopup({
+              apiUrl: config.conwayApiUrl,
+              account: identity.account,
+              creditsCents: financial.creditsCents,
+              chainType: config.chainType || identity.chainType || "evm",
+            });
+            if (topupResult?.success) {
+              log(config, `[AUTO-TOPUP] Bought $${topupResult.amountUsd} Conway credits from USDC`);
+              financial = await getFinancialState(
+                conway,
+                identity.address,
+                db,
+                config.chainType || identity.chainType || "evm",
+                true,
+              );
+            }
+          } catch (err: any) {
+            logger.warn(`Inline Conway auto-topup failed: ${err.message}`);
+          }
+        }
+      }
+
+      const effectiveTier = getOperationalSurvivalTier(financial, config);
+
+      if (effectiveTier === "critical") {
+        log(config, "[CRITICAL] No normal compute provider is currently available; limiting operation.");
+        db.setAgentState("critical");
+        onStateChange?.("critical");
+        inference.setLowComputeMode(true);
+      } else if (effectiveTier === "low_compute") {
+        db.setAgentState("low_compute");
+        onStateChange?.("low_compute");
         inference.setLowComputeMode(true);
       } else {
-        const tier = getSurvivalTier(financial.creditsCents);
-
-        // Inline auto-topup: if credits are critically low and USDC is
-        // available, buy credits NOW — before attempting inference.
-        // This prevents the agent from dying mid-loop while waiting for
-        // the heartbeat to fire. Uses a 60s cooldown to avoid hammering.
-        if ((tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
-          const INLINE_TOPUP_COOLDOWN_MS = 60_000;
-          const lastInlineTopup = db.getKV("last_inline_topup_attempt");
-          const cooldownExpired = !lastInlineTopup ||
-            Date.now() - new Date(lastInlineTopup).getTime() >= INLINE_TOPUP_COOLDOWN_MS;
-
-          if (cooldownExpired) {
-            db.setKV("last_inline_topup_attempt", new Date().toISOString());
-            try {
-              const { bootstrapTopup } = await import("../conway/topup.js");
-              const topupResult = await bootstrapTopup({
-                apiUrl: config.conwayApiUrl,
-                account: identity.account,
-                creditsCents: financial.creditsCents,
-                chainType: config.chainType || identity.chainType || "evm",
-              });
-              if (topupResult?.success) {
-                log(config, `[AUTO-TOPUP] Bought $${topupResult.amountUsd} credits from USDC mid-loop`);
-                // Re-fetch financial state after topup so the rest of
-                // the turn sees the updated balance.
-                financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
-              }
-            } catch (err: any) {
-              logger.warn(`Inline auto-topup failed: ${err.message}`);
-            }
-          }
+        if (db.getAgentState() !== "running") {
+          db.setAgentState("running");
+          onStateChange?.("running");
         }
-
-        // Re-evaluate tier after potential topup
-        const effectiveTier = getSurvivalTier(financial.creditsCents);
-
-        if (effectiveTier === "critical") {
-          log(config, "[CRITICAL] Credits critically low. Limited operation.");
-          db.setAgentState("critical");
-          onStateChange?.("critical");
-          inference.setLowComputeMode(true);
-        } else if (effectiveTier === "low_compute") {
-          db.setAgentState("low_compute");
-          onStateChange?.("low_compute");
-          inference.setLowComputeMode(true);
-        } else {
-          if (db.getAgentState() !== "running") {
-            db.setAgentState("running");
-            onStateChange?.("running");
-          }
-          inference.setLowComputeMode(false);
-        }
+        inference.setLowComputeMode(false);
       }
 
       // Build context — filter out purely idle turns (only status checks)
@@ -596,7 +597,7 @@ export async function runAgentLoop(
       pendingInput = undefined;
 
       // ── Inference Call (via router when available) ──
-      const survivalTier = getSurvivalTier(financial.creditsCents);
+      const survivalTier = getOperationalSurvivalTier(financial, config);
       log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${inference.getDefaultModel()})...`);
 
       const inferenceTools = toolsToInferenceFormat(tools);
@@ -948,39 +949,40 @@ async function getFinancialState(
   address: string,
   db?: AutomatonDatabase,
   chainType?: string,
+  conwayEnabled = true,
 ): Promise<FinancialState> {
   let creditsCents = _lastKnownCredits;
   let usdcBalance = _lastKnownUsdc;
 
-  try {
-    creditsCents = await conway.getCreditsBalance();
-    if (creditsCents > 0) _lastKnownCredits = creditsCents;
-  } catch (error) {
-    logger.error("Credits balance fetch failed", error instanceof Error ? error : undefined);
-    // Use last known balance from KV, not zero
-    if (db) {
-      const cached = db.getKV("last_known_balance");
-      if (cached) {
-        try {
-          const parsed = JSON.parse(cached);
-          logger.warn("Balance API failed, using cached balance");
-          return {
-            creditsCents: parsed.creditsCents ?? 0,
-            usdcBalance: parsed.usdcBalance ?? 0,
-            lastChecked: new Date().toISOString(),
-          };
-        } catch (parseError) {
-          logger.error("Failed to parse cached balance", parseError instanceof Error ? parseError : undefined);
+  if (conwayEnabled) {
+    try {
+      creditsCents = await conway.getCreditsBalance();
+      if (creditsCents > 0) _lastKnownCredits = creditsCents;
+    } catch (error) {
+      logger.error("Conway credits balance fetch failed", error instanceof Error ? error : undefined);
+      if (db) {
+        const cached = db.getKV("last_known_balance");
+        if (cached) {
+          try {
+            const parsed = JSON.parse(cached);
+            logger.warn("Conway balance API failed, using cached balance");
+            creditsCents = parsed.creditsCents ?? 0;
+            usdcBalance = parsed.usdcBalance ?? usdcBalance;
+          } catch (parseError) {
+            logger.error("Failed to parse cached balance", parseError instanceof Error ? parseError : undefined);
+            creditsCents = -1;
+          }
+        } else {
+          creditsCents = -1;
         }
+      } else {
+        creditsCents = -1;
       }
     }
-    // No cache available -- return conservative non-zero sentinel
-    logger.error("Balance API failed, no cache available");
-    return {
-      creditsCents: -1,
-      usdcBalance: -1,
-      lastChecked: new Date().toISOString(),
-    };
+  } else {
+    // No Conway account is configured. Zero here means "no Conway credits",
+    // not "no compute": operational survival is evaluated across providers.
+    creditsCents = 0;
   }
 
   try {
@@ -1008,6 +1010,36 @@ async function getFinancialState(
     usdcBalance,
     lastChecked: new Date().toISOString(),
   };
+}
+
+function getOperationalSurvivalTier(
+  financial: FinancialState,
+  config: AutomatonConfig,
+): SurvivalTier {
+  const hasConway = Boolean(config.conwayApiKey);
+  const hasAlternativeInference = Boolean(
+    process.env.OPENAI_API_KEY ||
+    process.env.ANTHROPIC_API_KEY ||
+    process.env.OLLAMA_BASE_URL ||
+    config.openaiApiKey ||
+    config.anthropicApiKey ||
+    config.ollamaBaseUrl,
+  );
+
+  // In provider-independent mode, Conway's credit balance is irrelevant.
+  // A configured direct inference backend means AUREON is normally operational;
+  // inference budgets still enforce spend limits separately.
+  if (!hasConway) {
+    return hasAlternativeInference ? "normal" : "critical";
+  }
+
+  // If Conway's balance endpoint is unavailable but another inference backend
+  // exists, keep operating rather than treating a provider outage as death.
+  if (financial.creditsCents < 0 && hasAlternativeInference) {
+    return "normal";
+  }
+
+  return getSurvivalTier(financial.creditsCents);
 }
 
 function log(_config: AutomatonConfig, message: string): void {
