@@ -196,10 +196,14 @@ async function run(): Promise<void> {
   // Load wallet (chain-aware)
   const { account, chainIdentity, chainType: walletChainType } = await getWallet();
   const resolvedChainType = config.chainType || walletChainType || "evm";
-  const apiKey = config.conwayApiKey || loadApiKeyFromConfig();
-  if (!apiKey) {
-    logger.error("No API key found. Run: automaton --provision");
-    process.exit(1);
+  const apiKey = config.conwayApiKey || loadApiKeyFromConfig() || "";
+  const conwayAvailable = apiKey.length > 0;
+
+  if (!conwayAvailable) {
+    logger.warn(
+      "Conway API key unavailable. Starting in provider-independent bootstrap mode; " +
+        "Conway-only services will remain dormant until a valid key is configured.",
+    );
   }
 
   // Initialize database
@@ -247,7 +251,7 @@ async function run(): Promise<void> {
 
   // Register automaton identity (one-time, immutable)
   const registrationState = db.getIdentity("conwayRegistrationStatus");
-  if (registrationState !== "registered") {
+  if (conwayAvailable && registrationState !== "registered") {
     try {
       const genesisPromptHash = config.genesisPrompt
         ? keccak256(toHex(config.genesisPrompt))
@@ -336,36 +340,42 @@ async function run(): Promise<void> {
     logger.warn(`[${new Date().toISOString()}] State repo init failed: ${err.message}`);
   }
 
-  // Bootstrap topup: buy minimum credits ($5) from USDC so the agent can start.
-  // The agent decides larger topups itself via the topup_credits tool.
-  try {
-    let bootstrapTimer: ReturnType<typeof setTimeout>;
-    const bootstrapTimeout = new Promise<null>((_, reject) => {
-      bootstrapTimer = setTimeout(() => reject(new Error("bootstrap topup timed out")), 15_000);
-    });
+  // Bootstrap topup is a Conway-specific capability. Keep it intact when Conway
+  // is available, but never make Conway availability a prerequisite for booting.
+  if (conwayAvailable) {
     try {
-      await Promise.race([
-        (async () => {
-          const creditsCents = await conway.getCreditsBalance().catch(() => 0);
-          const topupResult = await bootstrapTopup({
-            apiUrl: config.conwayApiUrl,
-            account,
-            creditsCents,
-            chainType: resolvedChainType,
-          });
-          if (topupResult?.success) {
-            logger.info(
-              `[${new Date().toISOString()}] Bootstrap topup: +$${topupResult.amountUsd} credits from USDC`,
-            );
-          }
-        })(),
-        bootstrapTimeout,
-      ]);
-    } finally {
-      clearTimeout(bootstrapTimer!);
+      let bootstrapTimer: ReturnType<typeof setTimeout>;
+      const bootstrapTimeout = new Promise<null>((_, reject) => {
+        bootstrapTimer = setTimeout(() => reject(new Error("bootstrap topup timed out")), 15_000);
+      });
+      try {
+        await Promise.race([
+          (async () => {
+            const creditsCents = await conway.getCreditsBalance().catch(() => 0);
+            const topupResult = await bootstrapTopup({
+              apiUrl: config.conwayApiUrl,
+              account,
+              creditsCents,
+              chainType: resolvedChainType,
+            });
+            if (topupResult?.success) {
+              logger.info(
+                `[${new Date().toISOString()}] Bootstrap topup: +${topupResult.amountUsd} credits from USDC`,
+              );
+            }
+          })(),
+          bootstrapTimeout,
+        ]);
+      } finally {
+        clearTimeout(bootstrapTimer!);
+      }
+    } catch (err: any) {
+      logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${err.message}`);
     }
-  } catch (err: any) {
-    logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${err.message}`);
+  } else {
+    logger.info(
+      `[${new Date().toISOString()}] Conway bootstrap topup disabled until a Conway API key is available.`,
+    );
   }
 
   // Start heartbeat daemon (Phase 1.1: DurableScheduler)
